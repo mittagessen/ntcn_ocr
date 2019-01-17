@@ -10,9 +10,8 @@ from torch.utils.data import DataLoader
 import torch.nn.functional as F
 
 from collections import defaultdict
-from char_lm.model import CausalNet
-from char_lm.dataset import TextSet
-
+from ntcn_ocr.model import CausalNet, TorchSeqRecognizer
+from ntcn_ocr.dataset import *
 import click
 
 class EarlyStopping(object):
@@ -105,46 +104,50 @@ def eval(model, workers, device, valid_seq_len, seq_len, hidden, layers, kernel,
 
 @cli.command()
 @click.option('-n', '--name', default=None, help='prefix for checkpoint file names')
-@click.option('-l', '--lrate', default=0.3, help='initial learning rate')
+@click.option('-l', '--lrate', default=0.001, help='initial learning rate')
 @click.option('-w', '--workers', default=0, help='number of workers loading training data')
 @click.option('-d', '--device', default='cpu', help='pytorch device')
 @click.option('-v', '--validation', default='val', help='validation set location')
 @click.option('--lag', show_default=True, default=20, help='Number of epochs to wait before stopping training without improvement')
 @click.option('--min-delta', show_default=True, default=0.005, help='Minimum improvement between epochs to reset early stopping')
-@click.option('--optimizer', show_default=True, default='SGD', type=click.Choice(['SGD', 'Adam']), help='optimizer')
+@click.option('--optimizer', show_default=True, default='Adam', type=click.Choice(['SGD', 'Adam']), help='optimizer')
 @click.option('--clip', show_default=True, default=0.15, help='gradient clipping value')
 @click.option('--threads', default=min(len(os.sched_getaffinity(0)), 4))
-@click.option('--valid-seq-len', default=320, help='part of the training sample used for back propagation')
-@click.option('--seq-len', default=400, help='total training sample sequence length')
-@click.option('--hidden', default=100, help='numer of hidden units per block')
+@click.option('--hidden', default=400, help='numer of hidden units in fc layers')
 @click.option('--layers', default=3, help='number of 3-layer blocks')
-@click.option('--kernel', default=3, help='kernel size')
-@click.option('-N', '--batch-size', default=128, help='batch size')
 @click.option('-r', '--regularization', default='dropout2d', type=click.Choice(['dropout', 'dropout2d', 'batchnorm']))
 @click.argument('ground_truth', nargs=1)
 def train(name, lrate, workers, device, validation, lag, min_delta, optimizer,
-          clip, threads, valid_seq_len, seq_len, hidden, layers, kernel,
-          batch_size, regularization, ground_truth):
+          clip, threads, hidden, layers, regularization, ground_truth):
 
     if not name:
-        name = '{}_{}_{}_{}_{}_{}_{}_{}'.format(optimizer.lower(), lrate, valid_seq_len, seq_len, hidden, layers, kernel, regularization)
+        name = '{}_{}_{}_{}_{}'.format(optimizer.lower(), lrate, hidden, layers, regularization)
     print('model output name: {}'.format(name))
 
     torch.set_num_threads(threads)
+    transforms = generate_input_transforms(1, 40, 0, 1, 16)
 
-    train_set = TextSet(glob.glob('{}/**/*.txt'.format(ground_truth), recursive=True))
-    train_data_loader = DataLoader(dataset=train_set, num_workers=workers, batch_size=batch_size, pin_memory=True)
-    val_set = TextSet(glob.glob('{}/**/*.txt'.format(validation), recursive=True), chars=train_set.chars)
-    val_data_loader = DataLoader(dataset=val_set, num_workers=workers, batch_size=batch_size, pin_memory=True)
-    avg_word_len = val_set.avg_word_len()
+    train_set = GroundTruthDataset(im_transforms=transforms, preload=False)
+    for im in glob.glob('{}/**/*.png'.format(ground_truth), recursive=True):
+        train_set.add(im)
+    train_set.encode()
+    o_dim = train_set.codec.max_label()+1
+
+    train_data_loader = DataLoader(dataset=train_set, num_workers=workers, pin_memory=True)
+    val_set = GroundTruthDataset(im_transforms=transforms, preload=False)
+    for im in glob.glob('{}/**/*.png'.format(validation), recursive=True):
+        val_set.add(im)
+    val_set.training_set = list(zip(val_set._images, val_set._gt))
+    val_data_loader = DataLoader(dataset=val_set, num_workers=workers, pin_memory=True)
 
     device = torch.device(device)
 
     print('loading network')
 
-    model = CausalNet(train_set.oh_dim, train_set.oh_dim, hidden, layers, kernel, reg=regularization).to(device)
-    criterion = nn.CrossEntropyLoss()
-
+    model = CausalNet(40, o_dim, lin_feat=hidden, out_channels=(36, 70), kernel_sizes=((7,5),(5,5)), layers=0, reg=regularization).to(device)
+    print(model)
+    criterion = nn.CTCLoss(reduction='none')
+    seq_rec = TorchSeqRecognizer(model, train_set.codec, train=True, device=device)
     if optimizer == 'SGD':
         opti = optim.SGD(filter(lambda p: p.requires_grad, model.parameters()), lr=lrate)
     else:
@@ -158,40 +161,35 @@ def train(name, lrate, workers, device, validation, lag, min_delta, optimizer,
                 input, target = sample[0].to(device, non_blocking=True), sample[1].to(device, non_blocking=True)
                 opti.zero_grad()
                 o = model(input)
-                o = o[:, :, :(seq_len - valid_seq_len)].contiguous()
-                target = target[:, :(seq_len - valid_seq_len)].contiguous()
-                loss = criterion(o, target)
+                o = o.squeeze(2)
+                loss = criterion(o.permute(2, 0, 1),
+                                 target,
+                                 (o.size(2),),
+                                 (target.size(1),))
                 epoch_loss += loss.item()
                 loss.backward()
                 if clip > 0:
-                    torch.nn.utils.clip_grad_norm(model.parameters(), clip)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), clip)
                 opti.step()
         torch.save({'state_dict': model.state_dict(),
                     'epoch': epoch,
-                    'seq_len': seq_len,
-                    'valid_seq_len': valid_seq_len,
                     'hidden': hidden,
                     'layers': layers,
-                    'kernel': kernel,
                     'regularization': regularization,
-                    'chars': dict(train_set.chars),
-                    'oh_dim': train_set.oh_dim}, '{}_{}.ckpt'.format(name, epoch))
+                    'chars': dict(train_set.chars)}, '{}_{}.ckpt'.format(name, epoch))
         print("===> epoch {} complete: avg. loss: {:.4f}".format(epoch, epoch_loss / len(train_data_loader)))
-        val_loss = evaluate(model, device, criterion, val_data_loader, seq_len, valid_seq_len)
+        chars, error = compute_error(seq_rec, val_set)
         model.train()
         st_it.update(val_loss)
-        print("===> epoch {} bpc: {:.4f} (ppl char/word: {:.4f}/{:.4f})".format(epoch,
-                                                                                1/np.log(2)*val_loss,
-                                                                                np.exp(val_loss),
-                                                                                np.exp(val_loss*avg_word_len)))
+        print("===> epoch {}: character accuracy: {})".format(epoch, (chars-error)/chars))
 
-def evaluate(model, device, criterion, data_loader, seq_len, valid_seq_len):
+def evaluate(model, device, criterion, validation_set, seq_len, valid_seq_len):
     """
     """
     model.eval()
     loss = 0.0
     with torch.no_grad():
-        for sample in data_loader:
+        for im, text in validation_set:
             input, target = sample[0].to(device), sample[1].to(device)
             o = model(input)
             o = o[:, :, :(seq_len - valid_seq_len)].contiguous()
