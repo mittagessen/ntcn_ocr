@@ -176,7 +176,7 @@ def train(name, lrate, workers, device, validation, lag, min_delta, optimizer,
                     'hidden': hidden,
                     'layers': layers,
                     'regularization': regularization,
-                    'chars': dict(train_set.chars)}, '{}_{}.ckpt'.format(name, epoch))
+                    'chars': dict(train_set.alphabet)}, '{}_{}.ckpt'.format(name, epoch))
         print("===> epoch {} complete: avg. loss: {:.4f}".format(epoch, epoch_loss / len(train_data_loader)))
         chars, error = compute_error(seq_rec, val_set)
         model.train()
