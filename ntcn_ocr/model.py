@@ -106,8 +106,7 @@ class CausalBlock(nn.Module):
             reg_l = partial(nn.BatchNorm1d, out_channels)
         else:
             raise Exception('invalid regularization layer selected')
-        padding = tuple((k - 1) // 2 for k in kernel_size)
-        padding = (padding[0], padding[1] + dilation[-1])
+        padding = tuple(d*(k - 1) // 2 for k, d in zip(kernel_size, dilation))
         self.layer = nn.Sequential(nn.Conv2d(in_channels, out_channels, kernel_size, stride=stride, padding=padding, dilation=dilation),
                                    nn.ReLU(),
                                    reg_l(),
@@ -117,11 +116,11 @@ class CausalBlock(nn.Module):
                                    nn.Conv2d(out_channels, out_channels, kernel_size, stride=stride, padding=padding, dilation=dilation),
                                    reg_l())
         # downsampling for residual
-        #self.residual = nn.Conv1d(in_channels, out_channels, 1) if in_channels != out_channels else None
+        self.residual = nn.Conv2d(in_channels, out_channels, 1) if in_channels != out_channels else None
 
     def forward(self, x):
         o = self.layer(x)
-        #o = torch.relu(o + self.residual(x) if self.residual else o + x)
+        o = torch.relu(o + self.residual(x) if self.residual else o + x)
         return o
 
 class TDNNBlock(nn.Module):
@@ -151,38 +150,31 @@ class FinalBlock(nn.Module):
 
 class CausalNet(nn.Module):
 
-    def __init__(self, input_size, output_size, lin_feat=450, out_channels=(32, 128, 512), layers=1, kernel_sizes=((7, 5), (5, 5), (3, 3)), dropout=0.1, reg='dropout'):
+    def __init__(self, input_size, output_size, out_channels=(64, 128, 256), layers=3, kernel_sizes=((7, 7), (5, 5), (3, 3)), dropout=0.1, reg='dropout'):
         super(CausalNet, self).__init__()
         l = []
         l.append(CausalBlock(1, out_channels[0], kernel_sizes[0], stride=1, dilation=(1, 1), dropout=dropout))
-        i = -1
-        for i in range(layers):
-            l.append(nn.AvgPool2d((2, 1)))
+        for i in range(layers-1):
+            l.append(nn.AvgPool2d(2))
             dilation_size = 2 ** (i+1)
             l.append(CausalBlock(out_channels[i], out_channels[i+1], kernel_sizes[i+1],
                                  stride=1, dilation=(1, dilation_size),
                                  dropout=dropout, reg=reg))
-        l.append(nn.AvgPool2d((2, 1)))
-        l.append(CausalBlock(out_channels[i+1], out_channels[-1], kernel_sizes[-1], stride=1, dilation=(1, i+2**2), dropout=dropout, reg=reg))
-        # kinda-(-8,-4,0,4,8)-TDNN by chaining a 1x5-5-dilated convolution with a linear layer
-        l.append(TDNNBlock(out_channels[-1], (input_size // ((layers + 1) * 2)) * out_channels[-1], lin_feat, kernel_size=(1, 5), dilation=5))
-        # same as above by with (-4, 0, 4)
-        l.append(TDNNBlock(lin_feat, lin_feat, lin_feat, kernel_size=(1, 3), dilation=3))
-        # and again
-        l.append(TDNNBlock(lin_feat, lin_feat, output_size, kernel_size=(1, 3), dilation=3))
-        l.append(FinalBlock())
-        self.net = nn.Sequential(*l)
+        self.encoder = nn.Sequential(*l)
+        self.decoder = nn.Linear(input_size//(layers+1) * out_channels[-1], output_size)
         self.init_weights()
 
     def forward(self, x):
-        return self.net(x)
+        o = self.encoder(x)
+        return self.decoder(o.reshape(o.shape[0], -1, o.shape[3]).transpose(1, 2))
 
     def init_weights(self):
         def _wi(m):
-            if isinstance(m, torch.nn.Conv1d):
+            if isinstance(m, torch.nn.Conv2d):
                 torch.nn.init.kaiming_uniform_(m.weight, nonlinearity='relu')
                 torch.nn.init.constant_(m.bias, 0)
             elif isinstance(m, torch.nn.Linear):
                 torch.nn.init.xavier_uniform_(m.weight)
                 torch.nn.init.constant_(m.bias, 0)
-        self.net.apply(_wi)
+        self.encoder.apply(_wi)
+        self.decoder.apply(_wi)

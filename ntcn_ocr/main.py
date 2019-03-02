@@ -105,6 +105,7 @@ def eval(model, workers, device, valid_seq_len, seq_len, hidden, layers, kernel,
 @cli.command()
 @click.option('-n', '--name', default=None, help='prefix for checkpoint file names')
 @click.option('-l', '--lrate', default=0.001, help='initial learning rate')
+@click.option('-w', '--weight-decay', show_default=True, default=0.0, help='Weight decay')
 @click.option('-w', '--workers', default=0, help='number of workers loading training data')
 @click.option('-d', '--device', default='cpu', help='pytorch device')
 @click.option('-v', '--validation', default='val', help='validation set location')
@@ -112,13 +113,11 @@ def eval(model, workers, device, valid_seq_len, seq_len, hidden, layers, kernel,
 @click.option('--min-delta', show_default=True, default=0.005, help='Minimum improvement between epochs to reset early stopping')
 @click.option('--optimizer', show_default=True, default='Adam', type=click.Choice(['SGD', 'Adam']), help='optimizer')
 @click.option('--clip', show_default=True, default=0.15, help='gradient clipping value')
-@click.option('--threads', default=min(len(os.sched_getaffinity(0)), 4))
-@click.option('--hidden', default=400, help='numer of hidden units in fc layers')
-@click.option('--layers', default=3, help='number of 3-layer blocks')
+@click.option('--threads', default=1)
 @click.option('-r', '--regularization', default='dropout2d', type=click.Choice(['dropout', 'dropout2d', 'batchnorm']))
 @click.argument('ground_truth', nargs=1)
-def train(name, lrate, workers, device, validation, lag, min_delta, optimizer,
-          clip, threads, hidden, layers, regularization, ground_truth):
+def train(name, lrate, weight_decay, workers, device, validation, lag, min_delta, optimizer,
+          clip, threads, regularization, ground_truth):
 
     if not name:
         name = '{}_{}_{}_{}_{}'.format(optimizer.lower(), lrate, hidden, layers, regularization)
@@ -144,27 +143,23 @@ def train(name, lrate, workers, device, validation, lag, min_delta, optimizer,
 
     print('loading network')
 
-    model = CausalNet(40, o_dim, lin_feat=hidden, out_channels=(36, 70), kernel_sizes=((7,5),(5,5)), layers=0, reg=regularization).to(device)
+    model = CausalNet(40, o_dim).to(device)
     print(model)
     criterion = nn.CTCLoss(reduction='none')
     seq_rec = TorchSeqRecognizer(model, train_set.codec, train=True, device=device)
-    if optimizer == 'SGD':
-        opti = optim.SGD(filter(lambda p: p.requires_grad, model.parameters()), lr=lrate)
-    else:
-        opti = optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=lrate)
+    opti = getattr(torch.optim, optimizer)(model.parameters(), lr=lrate, weight_decay=weight_decay)
     st_it = EarlyStopping(train_data_loader, min_delta, lag)
     val_loss = 9999
     for epoch, loader in enumerate(st_it):
         epoch_loss = 0
-        with click.progressbar(train_data_loader, label='epoch {}'.format(epoch)) as bar:
+        with click.progressbar(train_data_loader, label='epoch {}'.format(epoch), show_pos=True) as bar:
             for sample in bar:
                 input, target = sample[0].to(device, non_blocking=True), sample[1].to(device, non_blocking=True)
                 opti.zero_grad()
                 o = model(input)
-                o = o.squeeze(2)
-                loss = criterion(o.permute(2, 0, 1),
+                loss = criterion(o.transpose(0, 1),
                                  target,
-                                 (o.size(2),),
+                                 (o.size(1),),
                                  (target.size(1),))
                 epoch_loss += loss.item()
                 loss.backward()
