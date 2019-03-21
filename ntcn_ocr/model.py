@@ -60,8 +60,6 @@ class TorchSeqRecognizer(object):
         line = line.to(self.device)
         line = line.unsqueeze(0)
         o = self.nn(line)
-        if o.size(2) != 1:
-            raise KrakenInputException('Expected dimension 3 to be 1, actual {}'.format(o.size()))
         self.outputs = o.detach().squeeze().cpu().numpy()
         return self.outputs
 
