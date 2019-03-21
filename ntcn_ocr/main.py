@@ -169,7 +169,6 @@ def train(name, lrate, weight_decay, workers, device, validation, lag, min_delta
         torch.save({'state_dict': model.state_dict(),
                     'epoch': epoch,
                     'weight_decay': weight_decay,
-                    'layers': layers,
                     'regularization': regularization,
                     'chars': dict(train_set.alphabet)}, '{}_{}.ckpt'.format(name, epoch))
         print("===> epoch {} complete: avg. loss: {:.4f}".format(epoch, epoch_loss / len(train_data_loader)))
