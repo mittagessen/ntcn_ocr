@@ -120,7 +120,7 @@ def train(name, lrate, weight_decay, workers, device, validation, lag, min_delta
           clip, threads, regularization, ground_truth):
 
     if not name:
-        name = '{}_{}_{}_{}_{}'.format(optimizer.lower(), lrate, hidden, layers, regularization)
+        name = '{}_{}_{}_{}_{}'.format(optimizer.lower(), lrate, weight_decay, regularization, clip)
     print('model output name: {}'.format(name))
 
     torch.set_num_threads(threads)
