@@ -123,7 +123,7 @@ class DilConvBlock(nn.Module):
 
 class ConvSeqNet(nn.Module):
 
-    def __init__(self, input_size, output_size, out_channels=(32, 64, 128, 256), layers=4, kernel_sizes=((7, 7), (5, 5), (3, 3), (3, 3)), dropout=0.1, reg='dropout'):
+    def __init__(self, input_size, output_size, out_channels=(128, 256, 512), layers=4, kernel_sizes=((7, 7), (5, 5), (3, 3)), dropout=0.1, reg='dropout'):
         super().__init__()
         l = []
         l.append(DilConvBlock(1, out_channels[0], kernel_sizes[0], stride=1, dilation=(1, 1), dropout=dropout))
