@@ -95,7 +95,7 @@ class TorchSeqRecognizer(object):
 
 class DilConvBlock(nn.Module):
     def __init__(self, in_channels, out_channels, kernel_size, stride, dilation, dropout=0.1, reg='dropout'):
-        super()
+        super().__init__()
         if reg == 'dropout2d':
             reg_l = partial(nn.Dropout2d, dropout)
         elif reg == 'dropout':
@@ -124,7 +124,7 @@ class DilConvBlock(nn.Module):
 class ConvSeqNet(nn.Module):
 
     def __init__(self, input_size, output_size, out_channels=(32, 64, 128, 256), layers=4, kernel_sizes=((7, 7), (5, 5), (3, 3), (3, 3)), dropout=0.1, reg='dropout'):
-        super()
+        super().__init__()
         l = []
         l.append(DilConvBlock(1, out_channels[0], kernel_sizes[0], stride=1, dilation=(1, 1), dropout=dropout))
         for i in range(layers-1):
