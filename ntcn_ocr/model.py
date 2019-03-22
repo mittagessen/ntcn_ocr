@@ -60,7 +60,7 @@ class TorchSeqRecognizer(object):
         line = line.to(self.device)
         line = line.unsqueeze(0)
         o = self.nn(line)
-        self.outputs = o.detach().squeeze().cpu().numpy()
+        self.outputs = o.detach().squeeze().cpu().numpy().T
         return self.outputs
 
     def predict(self, line: torch.Tensor) -> List[Tuple[str, int, int, float]]:
@@ -93,9 +93,9 @@ class TorchSeqRecognizer(object):
         return self.decoder(o)
 
 
-class CausalBlock(nn.Module):
+class DilConvBlock(nn.Module):
     def __init__(self, in_channels, out_channels, kernel_size, stride, dilation, dropout=0.1, reg='dropout'):
-        super(CausalBlock, self).__init__()
+        super()
         if reg == 'dropout2d':
             reg_l = partial(nn.Dropout2d, dropout)
         elif reg == 'dropout':
@@ -121,41 +121,16 @@ class CausalBlock(nn.Module):
         o = torch.relu(o + self.residual(x) if self.residual else o + x)
         return o
 
-class TDNNBlock(nn.Module):
+class ConvSeqNet(nn.Module):
 
-    def __init__(self, in_channels, in_features, out_features, kernel_size, dilation):
-        super(TDNNBlock, self).__init__()
-        self.conv = nn.Sequential(nn.Conv2d(in_channels, in_channels, kernel_size, dilation=(1, dilation), padding=(0, 2*(dilation-1))), nn.Dropout(0.1))
-        self.linear = nn.Sequential(nn.Linear(in_features, out_features), nn.Dropout(0.5))
-
-    def forward(self, x):
-        o = self.conv(x)
-        # NCHW -> NW(C*H)
-        o = o.reshape(o.shape[0], -1, o.shape[3]).transpose(1, 2)
-        o = F.relu(self.linear(o))
-        return o.unsqueeze(2).transpose(1, 3)
-
-class FinalBlock(nn.Module):
-    def __init__(self):
-        super(FinalBlock, self).__init__()
-
-    def forward(self, x):
-        if not self.training:
-            o = F.softmax(x, dim=3)
-        else:
-            o = F.log_softmax(x, dim=3)
-        return o
-
-class CausalNet(nn.Module):
-
-    def __init__(self, input_size, output_size, out_channels=(64, 128, 256), layers=3, kernel_sizes=((7, 7), (5, 5), (3, 3)), dropout=0.1, reg='dropout'):
-        super(CausalNet, self).__init__()
+    def __init__(self, input_size, output_size, out_channels=(32, 64, 128, 256), layers=4, kernel_sizes=((7, 7), (5, 5), (3, 3), (3, 3)), dropout=0.1, reg='dropout'):
+        super()
         l = []
-        l.append(CausalBlock(1, out_channels[0], kernel_sizes[0], stride=1, dilation=(1, 1), dropout=dropout))
+        l.append(DilConvBlock(1, out_channels[0], kernel_sizes[0], stride=1, dilation=(1, 1), dropout=dropout))
         for i in range(layers-1):
             l.append(nn.AvgPool2d(2))
             dilation_size = 2 ** (i+1)
-            l.append(CausalBlock(out_channels[i], out_channels[i+1], kernel_sizes[i+1],
+            l.append(DilConvBlock(out_channels[i], out_channels[i+1], kernel_sizes[i+1],
                                  stride=1, dilation=(1, dilation_size),
                                  dropout=dropout, reg=reg))
         self.encoder = nn.Sequential(*l)

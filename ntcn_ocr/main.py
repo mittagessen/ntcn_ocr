@@ -10,7 +10,7 @@ from torch.utils.data import DataLoader
 import torch.nn.functional as F
 
 from collections import defaultdict
-from ntcn_ocr.model import CausalNet, TorchSeqRecognizer
+from ntcn_ocr.model import ConvSeqNet, TorchSeqRecognizer
 from ntcn_ocr.dataset import *
 import click
 
@@ -72,12 +72,12 @@ def eval(model, workers, device, valid_seq_len, seq_len, hidden, layers, kernel,
 
     device = torch.device(device)
     model_state = torch.load(model)
-    model = CausalNet(model_state['oh_dim'],
-                      model_state['oh_dim'],
-                      model_state['hidden'],
-                      model_state['layers'],
-                      model_state['kernel'],
-                      reg=model_state['regularization'])
+    model = ConvSeqNet(model_state['oh_dim'],
+                       model_state['oh_dim'],
+                       model_state['hidden'],
+                       model_state['layers'],
+                       model_state['kernel'],
+                       reg=model_state['regularization'])
     model.load_state_dict(model_state['state_dict'], map_location=lambda storage, loc: storage)
     model.eval()
     criterion = nn.CrossEntropyLoss()
@@ -104,7 +104,7 @@ def eval(model, workers, device, valid_seq_len, seq_len, hidden, layers, kernel,
 
 @cli.command()
 @click.option('-n', '--name', default=None, help='prefix for checkpoint file names')
-@click.option('-l', '--lrate', default=0.001, help='initial learning rate')
+@click.option('-l', '--lrate', default=1e-4, help='initial learning rate')
 @click.option('-w', '--weight-decay', show_default=True, default=0.0, help='Weight decay')
 @click.option('-w', '--workers', default=0, help='number of workers loading training data')
 @click.option('-d', '--device', default='cpu', help='pytorch device')
@@ -114,17 +114,18 @@ def eval(model, workers, device, valid_seq_len, seq_len, hidden, layers, kernel,
 @click.option('--optimizer', show_default=True, default='Adam', type=click.Choice(['SGD', 'Adam']), help='optimizer')
 @click.option('--clip', show_default=True, default=0.15, help='gradient clipping value')
 @click.option('--threads', default=1)
+@click.option('-h', '--line-height', show_default=True, default=40, help='Height to normalize input lines to')
 @click.option('-r', '--regularization', default='dropout2d', type=click.Choice(['dropout', 'dropout2d', 'batchnorm']))
 @click.argument('ground_truth', nargs=1)
 def train(name, lrate, weight_decay, workers, device, validation, lag, min_delta, optimizer,
-          clip, threads, regularization, ground_truth):
+          clip, line_height, threads, regularization, ground_truth):
 
     if not name:
-        name = '{}_{}_{}_{}_{}'.format(optimizer.lower(), lrate, weight_decay, regularization, clip)
+        name = '{}_{}_{}_{}_{}_{}'.format(optimizer.lower(), lrate, weight_decay, regularization, clip, line_height)
     print('model output name: {}'.format(name))
 
     torch.set_num_threads(threads)
-    transforms = generate_input_transforms(1, 40, 0, 1, 16)
+    transforms = generate_input_transforms(1, line_height, 0, 1, 16)
 
     train_set = GroundTruthDataset(im_transforms=transforms, preload=False)
     for im in glob.glob('{}/**/*.png'.format(ground_truth), recursive=True):
@@ -143,7 +144,7 @@ def train(name, lrate, weight_decay, workers, device, validation, lag, min_delta
 
     print('loading network')
 
-    model = CausalNet(40, o_dim).to(device)
+    model = ConvSeqNet(line_height, o_dim).to(device)
     print(model)
     criterion = nn.CTCLoss(reduction='none')
     seq_rec = TorchSeqRecognizer(model, train_set.codec, train=True, device=device)
@@ -170,6 +171,7 @@ def train(name, lrate, weight_decay, workers, device, validation, lag, min_delta
                     'epoch': epoch,
                     'weight_decay': weight_decay,
                     'regularization': regularization,
+                    'line_height': line_height,
                     'chars': dict(train_set.alphabet)}, '{}_{}.ckpt'.format(name, epoch))
         print("===> epoch {} complete: avg. loss: {:.4f}".format(epoch, epoch_loss / len(train_data_loader)))
         chars, error = compute_error(seq_rec, val_set)
