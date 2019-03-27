@@ -143,7 +143,12 @@ class ConvSeqNet(nn.Module):
 
     def forward(self, x):
         o = self.encoder(x)
-        return self.decoder(o.reshape(o.shape[0], -1, o.shape[3]).transpose(1, 2))
+        o = self.decoder(o.reshape(o.shape[0], -1, o.shape[3]).transpose(1, 2))
+        if not self.training:
+            o = F.softmax(o, dim=2)
+        else:
+            o = F.log_softmax(o, dim=2)
+        return o
 
     def init_weights(self):
         def _wi(m):
