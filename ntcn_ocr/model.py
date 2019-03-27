@@ -135,11 +135,11 @@ class ConvSeqNet(nn.Module):
                                  dropout=dropout, reg=reg))
         self.encoder = nn.Sequential(*l)
         self.decoder = nn.Sequential(nn.Linear(input_size//(layers+1) * out_channels[-1], tdnn_hidden),
+                                     nn.ReLu(),
                                      nn.Dropout(0.5),
-                                     nn.ReLu()
                                      nn.Linear(tdnn_hidden, tdnn_hidden),
-                                     nn.Dropout(0.5),
                                      nn.ReLU(),
+                                     nn.Dropout(0.5),
                                      nn.Linear(tdnn_hidden, output_size))
         self.init_weights()
 
