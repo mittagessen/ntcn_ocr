@@ -101,7 +101,7 @@ class DilConvBlock(nn.Module):
         elif reg == 'dropout':
             reg_l = partial(nn.Dropout, dropout)
         elif reg == 'batchnorm':
-            reg_l = partial(nn.BatchNorm1d, out_channels)
+            reg_l = partial(nn.BatchNorm2d, out_channels)
         else:
             raise Exception('invalid regularization layer selected')
         padding = tuple(d*(k - 1) // 2 for k, d in zip(kernel_size, dilation))
@@ -136,7 +136,7 @@ class ConvSeqNet(nn.Module):
         self.encoder = nn.Sequential(*l)
         self.decoder = nn.Sequential(nn.Linear(input_size//(layers+1) * out_channels[-1], tdnn_hidden),
                                      nn.ReLU(),
-                                     nn.Dropout(0.5),
+                                     nn.(0.5),
                                      nn.Linear(tdnn_hidden, tdnn_hidden),
                                      nn.ReLU(),
                                      nn.Dropout(0.5),
