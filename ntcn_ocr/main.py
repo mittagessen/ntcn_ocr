@@ -105,7 +105,7 @@ def eval(model, workers, device, valid_seq_len, seq_len, hidden, layers, kernel,
 @cli.command()
 @click.option('-n', '--name', default=None, help='prefix for checkpoint file names')
 @click.option('-l', '--lrate', default=1e-4, help='initial learning rate')
-@click.option('-w', '--weight-decay', show_default=True, default=0.0, help='Weight decay')
+@click.option('-e', '--weight-decay', show_default=True, default=0.0, help='Weight decay')
 @click.option('-w', '--workers', default=0, help='number of workers loading training data')
 @click.option('-d', '--device', default='cpu', help='pytorch device')
 @click.option('-v', '--validation', default='val', help='validation set location')
