@@ -121,6 +121,41 @@ class DilConvBlock(nn.Module):
         o = torch.relu(o + self.residual(x) if self.residual else o + x)
         return o
 
+class TDNNLayer(nn.Module):
+    """
+    A TDNN layer with dropout and ReLU nonlinearity.
+
+    Expects an input NHW and outputs NOW, where O is output_size. Taps are the
+    offsets folded into the current time step with negative values
+    corresponding to context to the left and positive values corresponding to
+    context to the right.
+    """
+    def __init__(self, input_size, output_size, dropout=0.5, taps=(-4, 0, 4)):
+        super().__init__()
+        self.input_size = len(taps) * input_size
+        self.output_size = output_size
+        self.taps = taps
+        self.lin = nn.Sequential(nn.Linear(self.input_size, self.output_size),
+                                 nn.ReLU(),
+                                 nn.Dropout(dropout))
+
+    def forward(self, x):
+        siz = x.shape
+        # append the taps by padding to the left/right
+        xs = []
+        for tap in self.taps:
+            if tap <= 0:
+                p = (abs(tap), max(self.taps) + tap)
+                offset = 0
+            elif tap > 0:
+                p = (0, max(self.taps) + tap)
+                offset = tap
+            xs.append(F.pad(x[:, :, offset:], p))
+        # stack and discard padding no longer needed 
+        x = torch.cat(xs, dim=1)[:, :, :siz[2]].transpose(1, 2)
+        return self.lin(x).transpose(1, 2)
+
+
 class ConvSeqNet(nn.Module):
 
     def __init__(self, input_size, output_size, out_channels=(36, 70, 70), layers=3, tdnn_hidden=500, kernel_sizes=((7, 7), (5, 5), (3, 3)), dropout=0.1, reg='dropout'):
@@ -134,18 +169,14 @@ class ConvSeqNet(nn.Module):
                                  stride=1, dilation=(1, dilation_size),
                                  dropout=dropout, reg=reg))
         self.encoder = nn.Sequential(*l)
-        self.decoder = nn.Sequential(nn.Linear(input_size//(layers+1) * out_channels[-1], tdnn_hidden),
-                                     nn.ReLU(),
-                                     nn.(0.5),
-                                     nn.Linear(tdnn_hidden, tdnn_hidden),
-                                     nn.ReLU(),
-                                     nn.Dropout(0.5),
-                                     nn.Linear(tdnn_hidden, output_size))
+        self.decoder = nn.Sequential(TDNNLayer(input_size//(layers+1) * out_channels[-1], tdnn_hidden),
+                                     TDNNLayer(tdnn_hidden, tdnn_hidden),
+                                     TDNNLayer(tdnn_hidden, output_size))
         self.init_weights()
 
     def forward(self, x):
         o = self.encoder(x)
-        o = self.decoder(o.reshape(o.shape[0], -1, o.shape[3]).transpose(1, 2))
+        o = self.decoder(o.reshape(o.shape[0], -1, o.shape[3]))
         if not self.training:
             o = F.softmax(o, dim=2)
         else:
