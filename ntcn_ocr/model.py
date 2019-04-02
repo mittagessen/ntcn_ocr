@@ -125,10 +125,10 @@ class TDNNLayer(nn.Module):
     """
     A TDNN layer with dropout and ReLU nonlinearity.
 
-    Expects an input NHW and outputs NOW, where O is output_size. Taps are the
-    offsets folded into the current time step with negative values
-    corresponding to context to the left and positive values corresponding to
-    context to the right.
+    Expects an input NWH and outputs NWO, where O is output_size. Taps are the
+    offsets in `W` folded into the current time step with negative values
+    corresponding to past values and positive values corresponding to future
+    values.
     """
     def __init__(self, input_size, output_size, dropout=0.5, taps=(-4, 0, 4)):
         super().__init__()
@@ -142,6 +142,7 @@ class TDNNLayer(nn.Module):
     def forward(self, x):
         siz = x.shape
         # append the taps by padding to the left/right
+        x = x.transpose(1, 2)
         xs = []
         for tap in self.taps:
             if tap <= 0:
@@ -153,7 +154,7 @@ class TDNNLayer(nn.Module):
             xs.append(F.pad(x[:, :, offset:], p))
         # stack and discard padding no longer needed 
         x = torch.cat(xs, dim=1)[:, :, :siz[2]].transpose(1, 2)
-        return self.lin(x).transpose(1, 2)
+        return self.lin(x)
 
 
 class ConvSeqNet(nn.Module):
@@ -176,7 +177,8 @@ class ConvSeqNet(nn.Module):
 
     def forward(self, x):
         o = self.encoder(x)
-        o = self.decoder(o.reshape(o.shape[0], -1, o.shape[3])).transpose(1, 2)
+        o = o.reshape(o.shape[0], -1, o.shape[3]).transpose(1, 2)
+        o = self.decoder(o)
         if not self.training:
             o = F.softmax(o, dim=2)
         else:
