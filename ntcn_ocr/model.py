@@ -16,12 +16,87 @@ from PIL import Image
 from functools import partial
 
 import kraken.lib.ctc_decoder
+class MultiParamSequential(nn.Sequential):
+    """
+    Sequential variant accepting multiple arguments.
+    """
+    def forward(self, *inputs):
+        for module in self._modules.values():
+            if type(inputs) == tuple:
+                inputs = module(*inputs)
+            else:
+                inputs = module(inputs)
+        return inputs
+
+
+class DilConvBlock(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, stride):
+        super().__init__()
+        self.kernel_size = kernel_size
+        self.padding = (kernel_size - 1)//2
+        self.stride = stride
+        self.block_b = nn.Sequential(nn.Conv1d(in_channels, out_channels, kernel_size, stride=self.stride, padding=self.padding),
+                                     nn.GroupNorm(32, out_channels),
+                                     nn.ReLU(),
+                                     nn.Dropout(0.1),
+                                     nn.Conv1d(out_channels, out_channels, kernel_size, stride=1, padding=self.padding),
+                                     nn.GroupNorm(32, out_channels))
+        self.block_a = nn.Sequential(nn.Conv1d(out_channels, out_channels, kernel_size, stride=1, padding=self.padding),
+                                     nn.GroupNorm(32, out_channels),
+                                     nn.ReLU(),
+                                     nn.Dropout(0.1),
+                                     nn.Conv1d(out_channels, out_channels, kernel_size, stride=1, padding=self.padding),
+                                     nn.GroupNorm(32, out_channels))
+
+        # downsampling for residual
+        self.residual = nn.Sequential(nn.Conv1d(in_channels, out_channels, kernel_size=1, stride=stride), nn.GroupNorm(32, out_channels))
+
+    def forward(self, x, seq_lens):
+        o = self.block_b(x)
+        o = torch.relu(o + self.residual(x) if self.residual else o + x)
+        o_b = self.block_a(o)
+        o_b = torch.relu(o_b + o)
+        seq_lens = torch.clamp(torch.floor((seq_lens+2*self.padding-(self.kernel_size-1)-1).float()/self.stride+1), min=1).int()
+        return o_b, seq_lens
+
+
+class ConvSeqNet(nn.Module):
+
+    def __init__(self, input_size, output_size, out_channels=(64, 128, 256), kernel_sizes=(3, 3, 3), blocks=3):
+        super().__init__()
+        l = []
+        l.append(DilConvBlock(input_size, out_channels[0], kernel_sizes[0], stride=1))
+        for i in range(blocks-1):
+            l.append(DilConvBlock(out_channels[i], out_channels[i+1], kernel_sizes[i+1], stride=2))
+        self.encoder = MultiParamSequential(*l)
+        self.decoder = nn.Conv1d(out_channels[-1], output_size, 1)
+        self.init_weights()
+
+    def forward(self, x, seq_lens):
+        o, seq_lens = self.encoder(x, seq_lens)
+        o = self.decoder(o)
+        if not self.training:
+            o = F.softmax(o, dim=2)
+        else:
+            o = F.log_softmax(o, dim=2)
+        return o, seq_lens
+
+    def init_weights(self):
+        def _wi(m):
+            if isinstance(m, torch.nn.Conv1d):
+                torch.nn.init.kaiming_uniform_(m.weight, nonlinearity='relu')
+                torch.nn.init.constant_(m.bias, 0)
+            elif isinstance(m, torch.nn.Linear):
+                torch.nn.init.xavier_uniform_(m.weight)
+                torch.nn.init.constant_(m.bias, 0)
+        self.encoder.apply(_wi)
+        self.decoder.apply(_wi)
 
 class TorchSeqRecognizer(object):
     """
     A class wrapping a TorchVGSLModel with a more comfortable recognition interface.
     """
-    def __init__(self, nn, codec=None, decoder=kraken.lib.ctc_decoder.greedy_decoder, train: bool = False, device: str = 'cpu') -> None:
+    def __init__(self, nn, codec, decoder=kraken.lib.ctc_decoder.greedy_decoder, train: bool = False, device: str = 'cpu') -> None:
         """
         Constructs a sequence recognizer from a VGSL model and a decoder.
 
@@ -51,147 +126,77 @@ class TorchSeqRecognizer(object):
         self.device = device
         self.nn.to(device)
 
-    def forward(self, line: torch.Tensor) -> np.array:
+    def forward(self, line: torch.Tensor, lens: torch.Tensor = None) -> np.array:
         """
-        Performs a forward pass on a torch tensor of a line with shape (C, H, W)
-        and returns a numpy array (W, C).
-        """
-        # make CHW -> 1CHW
-        line = line.to(self.device)
-        line = line.unsqueeze(0)
-        o = self.nn(line)
-        self.outputs = o.detach().squeeze().cpu().numpy().T
-        return self.outputs
+        Performs a forward pass on a torch tensor of one or more lines with
+        shape (N, C, H, W) and returns a numpy array (N, W, C).
 
-    def predict(self, line: torch.Tensor) -> List[Tuple[str, int, int, float]]:
+        Args:
+            line (torch.Tensor): NCHW line tensor
+            lens (torch.Tensor): Optional tensor containing sequence lengths if N > 1
+
+        Returns:
+            Tuple with (N, W, C) shaped numpy array and final output sequence
+            lengths.
         """
-        Performs a forward pass on a torch tensor of a line with shape (C, H, W)
+        line = line.to(self.device)
+        o, olens = self.nn(line, lens)
+        self.outputs = o.detach().cpu().numpy()
+        if olens is not None:
+            olens = olens.cpu().numpy()
+        return self.outputs, olens
+
+    def predict(self, line: torch.Tensor, lens: torch.Tensor = None) -> List[List[Tuple[str, int, int, float]]]:
+        """
+        Performs a forward pass on a torch tensor of a line with shape (N, C, H, W)
         and returns the decoding as a list of tuples (string, start, end,
         confidence).
-        """
-        o = self.forward(line)
-        locs = self.decoder(o)
-        return self.codec.decode(locs)
 
-    def predict_string(self, line: torch.Tensor) -> str:
+        Args:
+            line (torch.Tensor): NCHW line tensor
+            lens (torch.Tensor): Optional tensor containing sequence lengths if N > 1
+
+        Returns:
+            List of decoded sequences.
         """
-        Performs a forward pass on a torch tensor of a line with shape (C, H, W)
+        o, olens = self.forward(line, lens)
+        dec_seqs = []
+        if olens is not None:
+            for seq, seq_len in zip(o, olens):
+                locs = self.decoder(seq[:, :seq_len])
+                dec_seqs.append(self.codec.decode(locs))
+        else:
+            locs = self.decoder(o[0])
+            dec_seqs.append(self.codec.decode(locs))
+        return dec_seqs
+
+    def predict_string(self, line: torch.Tensor, lens: torch.Tensor = None) -> List[str]:
+        """
+        Performs a forward pass on a torch tensor of a line with shape (N, C, H, W)
         and returns a string of the results.
         """
-        o = self.forward(line)
-        locs = self.decoder(o)
-        decoding = self.codec.decode(locs)
-        return ''.join(x[0] for x in decoding)
+        o, olens = self.forward(line, lens)
+        dec_strs = []
+        if olens is not None:
+            for seq, seq_len in zip(o, olens):
+                locs = self.decoder(seq[:, :seq_len])
+                dec_strs.append(''.join(x[0] for x in self.codec.decode(locs)))
+        else:
+            locs = self.decoder(o[0])
+            dec_strs.append(''.join(x[0] for x in self.codec.decode(locs)))
+        return dec_strs
 
-    def predict_labels(self, line: torch.tensor) -> List[Tuple[int, int, int, float]]:
+    def predict_labels(self, line: torch.tensor, lens: torch.Tensor = None) -> List[List[Tuple[int, int, int, float]]]:
         """
-        Performs a forward pass on a torch tensor of a line with shape (C, H, W)
+        Performs a forward pass on a torch tensor of a line with shape (N, C, H, W)
         and returns a list of tuples (class, start, end, max). Max is the
         maximum value of the softmax layer in the region.
         """
-        o = self.forward(line)
-        return self.decoder(o)
-
-
-class DilConvBlock(nn.Module):
-    def __init__(self, in_channels, out_channels, kernel_size, stride, dilation, dropout=0.1, reg='dropout'):
-        super().__init__()
-        if reg == 'dropout2d':
-            reg_l = partial(nn.Dropout2d, dropout)
-        elif reg == 'dropout':
-            reg_l = partial(nn.Dropout, dropout)
-        elif reg == 'batchnorm':
-            reg_l = partial(nn.BatchNorm2d, out_channels)
+        o, olens = self.forward(line, lens)
+        oseqs = []
+        if olens is not None:
+            for seq, seq_len in zip(o, olens):
+                oseqs.append(self.decoder(seq[:, :seq_len]))
         else:
-            raise Exception('invalid regularization layer selected')
-        padding = tuple(d*(k - 1) // 2 for k, d in zip(kernel_size, dilation))
-        self.layer = nn.Sequential(nn.Conv2d(in_channels, out_channels, kernel_size, stride=stride, padding=padding, dilation=dilation),
-                                   nn.ReLU(),
-                                   reg_l(),
-                                   nn.Conv2d(out_channels, out_channels, kernel_size, stride=stride, padding=padding, dilation=dilation),
-                                   nn.ReLU(),
-                                   reg_l(),
-                                   nn.Conv2d(out_channels, out_channels, kernel_size, stride=stride, padding=padding, dilation=dilation),
-                                   reg_l())
-        # downsampling for residual
-        self.residual = nn.Conv2d(in_channels, out_channels, 1) if in_channels != out_channels else None
-
-    def forward(self, x):
-        o = self.layer(x)
-        o = torch.relu(o + self.residual(x) if self.residual else o + x)
-        return o
-
-class TDNNLayer(nn.Module):
-    """
-    A TDNN layer with dropout and ReLU nonlinearity.
-
-    Expects an input NWH and outputs NWO, where O is output_size. Taps are the
-    offsets in `W` folded into the current time step with negative values
-    corresponding to past values and positive values corresponding to future
-    values.
-    """
-    def __init__(self, input_size, output_size, dropout=0.5, taps=(-4, 0, 4)):
-        super().__init__()
-        self.input_size = len(taps) * input_size
-        self.output_size = output_size
-        self.taps = taps
-        self.lin = nn.Sequential(nn.Linear(self.input_size, self.output_size),
-                                 nn.ReLU(),
-                                 nn.Dropout(dropout))
-
-    def forward(self, x):
-        siz = x.shape
-        # append the taps by padding to the left/right
-        x = x.transpose(1, 2)
-        xs = []
-        for tap in self.taps:
-            if tap <= 0:
-                p = (abs(tap), max(self.taps) + tap)
-                offset = 0
-            elif tap > 0:
-                p = (0, max(self.taps) + tap)
-                offset = tap
-            xs.append(F.pad(x[:, :, offset:], p))
-        # stack and discard padding no longer needed 
-        x = torch.cat(xs, dim=1)[:, :, :siz[2]].transpose(1, 2)
-        return self.lin(x)
-
-
-class ConvSeqNet(nn.Module):
-
-    def __init__(self, input_size, output_size, out_channels=(36, 70, 70), layers=3, tdnn_hidden=500, kernel_sizes=((7, 7), (5, 5), (3, 3)), dropout=0.1, reg='dropout'):
-        super().__init__()
-        l = []
-        l.append(DilConvBlock(1, out_channels[0], kernel_sizes[0], stride=1, dilation=(1, 1), dropout=dropout))
-        for i in range(layers-1):
-            l.append(nn.AvgPool2d(2))
-            dilation_size = 2 ** (i+1)
-            l.append(DilConvBlock(out_channels[i], out_channels[i+1], kernel_sizes[i+1],
-                                 stride=1, dilation=(1, dilation_size),
-                                 dropout=dropout, reg=reg))
-        self.encoder = nn.Sequential(*l)
-        self.decoder = nn.Sequential(TDNNLayer(input_size//(layers+1) * out_channels[-1], tdnn_hidden),
-                                     TDNNLayer(tdnn_hidden, tdnn_hidden),
-                                     TDNNLayer(tdnn_hidden, output_size))
-        self.init_weights()
-
-    def forward(self, x):
-        o = self.encoder(x)
-        o = o.reshape(o.shape[0], -1, o.shape[3]).transpose(1, 2)
-        o = self.decoder(o)
-        if not self.training:
-            o = F.softmax(o, dim=2)
-        else:
-            o = F.log_softmax(o, dim=2)
-        return o
-
-    def init_weights(self):
-        def _wi(m):
-            if isinstance(m, torch.nn.Conv2d):
-                torch.nn.init.kaiming_uniform_(m.weight, nonlinearity='relu')
-                torch.nn.init.constant_(m.bias, 0)
-            elif isinstance(m, torch.nn.Linear):
-                torch.nn.init.xavier_uniform_(m.weight)
-                torch.nn.init.constant_(m.bias, 0)
-        self.encoder.apply(_wi)
-        self.decoder.apply(_wi)
+            oseqs.append(self.decoder(o[0]))
+        return oseqs

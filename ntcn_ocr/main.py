@@ -11,49 +11,33 @@ import torch.nn.functional as F
 
 from collections import defaultdict
 from ntcn_ocr.model import ConvSeqNet, TorchSeqRecognizer
-from ntcn_ocr.dataset import *
 import click
 
-class EarlyStopping(object):
-    """
-    Early stopping to terminate training when validation loss doesn't improve
-    over a certain time.
-    """
-    def __init__(self, it=None, min_delta=0.002, lag=5):
-        """
-        Args:
-            it (torch.utils.data.DataLoader): training data loader
-            min_delta (float): minimum change in validation loss to qualify as improvement.
-            lag (int): Number of epochs to wait for improvement before
-                       terminating.
-        """
-        self.min_delta = min_delta
-        self.lag = lag
-        self.it = it
-        self.best_loss = 0
-        self.wait = 0
-
-    def __iter__(self):
-        return self
-
-    def __next__(self):
-        #if self.wait >= self.lag:
-        #     raise StopIteration
-        return self.it
-
-    def update(self, val_loss):
-        """
-        Updates the internal validation loss state
-        """
-        if (val_loss - self.best_loss) < self.min_delta:
-            self.wait += 1
-        else:
-            self.wait = 0
-            self.best_loss = val_loss
+from kraken.lib.train import EpochStopping
+from kraken.lib.dataset import GroundTruthDataset, generate_input_transforms, InfiniteDataLoader, compute_error
 
 @click.group()
 def cli():
     pass
+
+def collate_sequences(batch):
+    """
+    Sorts and pads sequences.
+    """
+    for x in batch:
+        x['image'] = x['image'].squeeze()
+    sorted_batch = sorted(batch, key=lambda x: x['image'].shape[1], reverse=True)
+    seqs = [x['image'] for x in sorted_batch]
+    seq_lens = torch.LongTensor([seq.shape[1] for seq in seqs])
+    max_len = seqs[0].shape[1]
+    seqs = torch.stack([F.pad(seq, pad=(0, max_len-seq.shape[1])) for seq in seqs])
+    if isinstance(sorted_batch[0]['target'], str):
+        labels = [x['target'] for x in sorted_batch]
+    else:
+        labels = torch.cat([x['target'] for x in sorted_batch]).long()
+    label_lens = torch.LongTensor([len(x['target']) for x in sorted_batch])
+    return {'image': seqs, 'target': labels, 'seq_lens': seq_lens, 'target_lens': label_lens}
+
 
 @cli.command()
 @click.option('-m', '--model', default=None, help='model name')
@@ -104,7 +88,8 @@ def eval(model, workers, device, valid_seq_len, seq_len, hidden, layers, kernel,
 
 @cli.command()
 @click.option('-n', '--name', default=None, help='prefix for checkpoint file names')
-@click.option('-l', '--lrate', default=1e-4, show_default=True, help='initial learning rate')
+@click.option('-B', '--batch-size', default=1, show_default=True, help='minibatch size')
+@click.option('-l', '--lrate', default=1e-3, show_default=True, help='initial learning rate')
 @click.option('-e', '--weight-decay', show_default=True, default=0.0, help='Weight decay')
 @click.option('-w', '--workers', default=0, show_default=True, help='number of workers loading training data')
 @click.option('-d', '--device', default='cpu', show_default=True, help='pytorch device')
@@ -112,20 +97,19 @@ def eval(model, workers, device, valid_seq_len, seq_len, hidden, layers, kernel,
 @click.option('--lag', show_default=True, default=20, help='Number of epochs to wait before stopping training without improvement')
 @click.option('--min-delta', show_default=True, default=0.005, help='Minimum improvement between epochs to reset early stopping')
 @click.option('--optimizer', show_default=True, default='Adam', type=click.Choice(['SGD', 'Adam']), help='optimizer')
-@click.option('--clip', show_default=True, default=0.15, help='gradient clipping value')
+@click.option('--clip', show_default=True, default=0.0, help='gradient clipping value')
 @click.option('--threads', show_default=True, default=1)
 @click.option('-h', '--line-height', show_default=True, default=40, help='Height to normalize input lines to')
-@click.option('-r', '--regularization', show_default=True, default='dropout2d', type=click.Choice(['dropout', 'dropout2d', 'batchnorm']))
 @click.argument('ground_truth', nargs=1)
-def train(name, lrate, weight_decay, workers, device, validation, lag, min_delta, optimizer,
-          clip, line_height, threads, regularization, ground_truth):
+def train(name, batch_size, lrate, weight_decay, workers, device, validation, lag, min_delta, optimizer,
+          clip, line_height, threads, ground_truth):
 
     if not name:
-        name = '{}_{}_{}_{}_{}_{}'.format(optimizer.lower(), lrate, weight_decay, regularization, clip, line_height)
+        name = '{}_{}_{}_{}_{}'.format(optimizer.lower(), lrate, weight_decay, clip, line_height)
     print('model output name: {}'.format(name))
 
     torch.set_num_threads(threads)
-    transforms = generate_input_transforms(1, line_height, 0, 1, 16)
+    transforms = generate_input_transforms(1, line_height, 0, 1, 16, False, False)
 
     train_set = GroundTruthDataset(im_transforms=transforms, preload=False)
     for im in glob.glob('{}/**/*.png'.format(ground_truth), recursive=True):
@@ -133,12 +117,23 @@ def train(name, lrate, weight_decay, workers, device, validation, lag, min_delta
     train_set.encode()
     o_dim = train_set.codec.max_label()+1
 
-    train_data_loader = DataLoader(dataset=train_set, num_workers=workers, pin_memory=True)
+    train_loader = InfiniteDataLoader(train_set,
+                                      batch_size=batch_size,
+                                      shuffle=True,
+                                      num_workers=workers,
+                                      pin_memory=True,
+                                      collate_fn=collate_sequences)
+
     val_set = GroundTruthDataset(im_transforms=transforms, preload=False)
     for im in glob.glob('{}/**/*.png'.format(validation), recursive=True):
         val_set.add(im)
-    val_set.training_set = list(zip(val_set._images, val_set._gt))
-    val_data_loader = DataLoader(dataset=val_set, num_workers=workers, pin_memory=True)
+    val_set.no_encode()
+    val_loader = DataLoader(val_set,
+                            batch_size=batch_size,
+                            num_workers=workers,
+                            pin_memory=True,
+                            collate_fn=collate_sequences)
+
 
     device = torch.device(device)
 
@@ -146,50 +141,44 @@ def train(name, lrate, weight_decay, workers, device, validation, lag, min_delta
 
     model = ConvSeqNet(line_height, o_dim).to(device)
     print(model)
-    criterion = nn.CTCLoss(reduction='none')
-    seq_rec = TorchSeqRecognizer(model, train_set.codec, train=True, device=device)
+    criterion = nn.CTCLoss(reduction='sum', zero_infinity=True)
     opti = getattr(torch.optim, optimizer)(model.parameters(), lr=lrate, weight_decay=weight_decay)
-    st_it = EarlyStopping(train_data_loader, min_delta, lag)
-    val_loss = 9999
-    for epoch, loader in enumerate(st_it):
-        epoch_loss = 0
-        with click.progressbar(train_data_loader, label='epoch {}'.format(epoch), show_pos=True) as bar:
-            for sample in bar:
-                input, target = sample[0].to(device, non_blocking=True), sample[1].to(device, non_blocking=True)
+    st_it = EpochStopping(50)
+    epoch = 0
+    while st_it.trigger():
+        with click.progressbar(train_loader, label='epoch {}'.format(epoch), show_pos=True) as bar:
+            for _, batch in zip(range(len(train_loader)), bar):
+                input, target = batch['image'], batch['target']
+                input = input.to(device, non_blocking=True)
+                target = target.to(device, non_blocking=True)
+                input = input.requires_grad_()
+
+                seq_lens, label_lens = batch['seq_lens'], batch['target_lens']
+                seq_lens = seq_lens.to(device, non_blocking=True)
+                label_lens = label_lens.to(device, non_blocking=True)
+                output, seq_lens = model(input, seq_lens)
+
                 opti.zero_grad()
-                o = model(input)
-                loss = criterion(o.transpose(0, 1),
+                loss = criterion(output.permute(2, 0, 1),
                                  target,
-                                 (o.size(1),),
-                                 (target.size(1),))
-                epoch_loss += loss.item()
+                                 seq_lens,
+                                 label_lens)
+
                 loss.backward()
                 if clip > 0:
                     torch.nn.utils.clip_grad_norm_(model.parameters(), clip)
-                opti.step()
-        torch.save({'state_dict': model.state_dict(),
-                    'epoch': epoch,
-                    'weight_decay': weight_decay,
-                    'regularization': regularization,
-                    'line_height': line_height,
-                    'chars': dict(train_set.alphabet)}, '{}_{}.ckpt'.format(name, epoch))
-        print("===> epoch {} complete: avg. loss: {:.4f}".format(epoch, epoch_loss / len(train_data_loader)))
-        model.eval()
-        chars, error = compute_error(seq_rec, val_set)
-        model.train()
-        st_it.update(val_loss)
-        print("===> epoch {}: character accuracy: {})".format(epoch, (chars-error)/chars))
+                del loss, output
+            torch.save({'state_dict': model.state_dict(),
+                        'epoch': epoch,
+                        'weight_decay': weight_decay,
+                        'line_height': line_height,
+                        'chars': dict(train_set.alphabet)}, '{}_{}.ckpt'.format(name, epoch))
+            model.eval()
+            seq_rec = TorchSeqRecognizer(model, train_set.codec, device=device)
+            chars, error = compute_error(seq_rec, val_loader)
+            model.train()
+            print("===> epoch {}: character accuracy: {})".format(epoch, (chars-error)/chars))
+        epoch += 1
 
-def evaluate(model, device, criterion, validation_set, seq_len, valid_seq_len):
-    """
-    """
-    model.eval()
-    loss = 0.0
-    with torch.no_grad():
-        for im, text in validation_set:
-            input, target = sample[0].to(device), sample[1].to(device)
-            o = model(input)
-            o = o[:, :, :(seq_len - valid_seq_len)].contiguous()
-            target = target[:, :(seq_len - valid_seq_len)].contiguous()
-            loss += criterion(o, target)
-    return loss / len(data_loader)
+if __name__ == '__main__':
+    cli()
