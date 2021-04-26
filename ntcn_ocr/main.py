@@ -143,6 +143,7 @@ def train(name, batch_size, lrate, weight_decay, workers, device, validation, la
     print(model)
     criterion = nn.CTCLoss(reduction='sum', zero_infinity=True)
     opti = getattr(torch.optim, optimizer)(model.parameters(), lr=lrate, weight_decay=weight_decay)
+    lr_sched = optim.lr_scheduler.ReduceLROnPlateau(opti, mode='max', patience=3)
     st_it = EpochStopping(50)
     epoch = 0
     while st_it.trigger():
@@ -177,6 +178,7 @@ def train(name, batch_size, lrate, weight_decay, workers, device, validation, la
             seq_rec = TorchSeqRecognizer(model, train_set.codec, device=device)
             chars, error = compute_error(seq_rec, val_loader)
             model.train()
+            lr_sched.step((chars-error)/chars)
             print("===> epoch {}: character accuracy: {})".format(epoch, (chars-error)/chars))
         epoch += 1
 
