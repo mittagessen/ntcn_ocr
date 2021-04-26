@@ -168,6 +168,7 @@ def train(name, batch_size, lrate, weight_decay, workers, device, validation, la
                 loss.backward()
                 if clip > 0:
                     torch.nn.utils.clip_grad_norm_(model.parameters(), clip)
+                opti.step()
                 del loss, output
             torch.save({'state_dict': model.state_dict(),
                         'epoch': epoch,
@@ -179,7 +180,7 @@ def train(name, batch_size, lrate, weight_decay, workers, device, validation, la
             chars, error = compute_error(seq_rec, val_loader)
             model.train()
             lr_sched.step((chars-error)/chars)
-            print("===> epoch {}: character accuracy: {})".format(epoch, (chars-error)/chars))
+            print("===> epoch {}: character accuracy: {})".format(epoch, (chars-error)/chars), end='')
         epoch += 1
 
 if __name__ == '__main__':
